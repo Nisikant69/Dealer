@@ -1,66 +1,73 @@
-import requests
-from fastapi import Request, Response
-from sqlalchemy.orm import Session
 import json
+import httpx
+import redis
+import datetime
+from fastapi import Request, Response, APIRouter
+from sqlalchemy.orm import Session
 
 from ...core.config import settings
 from ...core.database import SessionLocal
 from ...models.customer_model import Customer
 from ...workflow.tasks import score_lead_task
 
-# WARNING: This is a simple in-memory dictionary for conversation history.
-# It is NOT suitable for production. For a real system, this state
-# must be managed in a persistent store like Redis or your database.
-conversation_history = {}
+router = APIRouter()
 
-async def handle_vapi_webhook(request: Request):
-    """
-    Handles all incoming webhook events from the Vapi voice platform.
-    This is the core logic of the voice agent.
-    """
-    try:
-        payload = await request.json()
+# --- REDIS & HTTPX CLIENTS (Keep these as they were) ---
+try:
+    redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    redis_client.ping()
+    print("[VOICE AGENT] Connected to Redis successfully.")
+except Exception as e:
+    print(f"[VOICE AGENT CRITICAL ERROR] Could not connect to Redis: {e}")
+    redis_client = None
 
-        print(f"--- RAW VAPI PAYLOAD RECEIVED ---\n{json.dumps(payload, indent=2)}\n---------------------------------")
+http_client = httpx.AsyncClient(timeout=25.0)
 
-        message = payload.get("message", {})
-        message_type = message.get("type")
-
-        if message_type == "voice-input":
-            return await handle_assistant_request(message)
-        elif message_type == "hang":
-            return handle_call_end(message)
-        elif message_type == "status-update":
-            return handle_call_start(message)
-        else:
-            # Acknowledge other event types without taking action.
-            return Response(status_code=200)
-
-    except Exception as e:
-        print(f"[VOICE AGENT ERROR] Failed to process webhook: {e}")
-        return Response(status_code=500, content=f"Internal Server Error: {str(e)}")
+# --- HANDLERS (Keep handle_call_start, handle_assistant_request, handle_call_end as they were) ---
 
 def handle_call_start(message: dict):
+    # ... (Keep existing code) ...
     call_id = message.get("call", {}).get("id")
-    if call_id:
-        conversation_history[call_id] = []
-        print(f"[VOICE AGENT] Initialized history for call: {call_id}")
-    return Response(status_code=200)
+    if not call_id or not redis_client:
+        print("[VOICE AGENT ERROR] Call-start: No call_id or Redis client.")
+        return Response(status_code=500)
+    try:
+        redis_client.set(call_id, json.dumps([]), ex=3600)
+        print(f"[VOICE AGENT] Initialized Redis history for call: {call_id}")
+        return Response(status_code=200)
+    except Exception as e:
+        print(f"[REDIS ERROR] handle_call_start: {e}")
+        return Response(status_code=500)
 
 async def handle_assistant_request(message: dict):
+    # ... (Keep existing code for querying Ollama and updating Redis) ...
     call_id = message.get("call", {}).get("id")
-    transcript = message.get("transcript")
+    # Vapi sends the transcript *inside* the 'message' object for chat/completions
+    # Check both potential locations for the transcript data
+    transcript_data = message.get("transcript") # Original location
+    if not transcript_data and message.get("messages"):
+        # For chat/completions, the user message is often the last one in the list
+        user_messages = [m for m in message.get("messages", []) if m.get("role") == "user"]
+        if user_messages:
+            transcript_data = user_messages[-1].get("content")
 
-    if not settings.OLLAMA_API_ENDPOINT:
-        print("[VOICE AGENT ERROR] OLLAMA_API_ENDPOINT is not configured.")
-        return {"error": "Assistant brain is not configured."}
+    transcript = transcript_data
 
-    # Retrieve and format conversation history
-    history = conversation_history.get(call_id, [])
+    if not all([call_id, transcript, redis_client, settings.OLLAMA_API_ENDPOINT]):
+        print("[VOICE AGENT ERROR] Assistant-request: Missing required data or config.")
+        return {"error": "Assistant brain is misconfigured."}
+
+    # 1. Retrieve history
+    try:
+        history_json = redis_client.get(call_id)
+        history = json.loads(history_json) if history_json else []
+    except Exception as e:
+        print(f"[REDIS ERROR] handle_assistant_request (GET): {e}")
+        return {"choices": [{"message": {"role": "assistant", "content": "I'm having trouble accessing my memory. Please repeat that."}}]} # Match OpenAI format
+
+    # 2. Construct prompt
     formatted_history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history])
-
-    # Construct the prompt for the local LLM. This is a critical step.
-    prompt = f"""You are a professional, polite, and efficient AI assistant for a high-end luxury car dealership. Your goal is to qualify the lead by understanding their interest and, if appropriate, to schedule a showroom appointment or test drive. Keep your responses concise for a voice conversation.
+    prompt = f"""You are a professional, polite, and efficient AI assistant...
 
 Conversation History:
 {formatted_history}
@@ -75,29 +82,44 @@ Assistant:"""
     }
 
     print(f"[VOICE AGENT] Sending prompt to Ollama for call {call_id}...")
+
+    # 3. Call Ollama
     try:
-        response = requests.post(settings.OLLAMA_API_ENDPOINT, json=payload, timeout=25)
+        response = await http_client.post(settings.OLLAMA_API_ENDPOINT, json=payload)
         response.raise_for_status()
         assistant_response = response.json().get("response", "").strip()
         print(f"[VOICE AGENT] Received from Ollama: {assistant_response}")
 
-        # Update history
+    except httpx.RequestError as e:
+        print(f"[VOICE AGENT ERROR] Could not connect to Ollama: {e}")
+        # Return error in OpenAI format
+        return {"choices": [{"message": {"role": "assistant", "content": "I apologize, I'm having connection issues. Could you repeat?"}}]}
+
+    # 4. Update history
+    try:
         history.append({"role": "User", "content": transcript})
         history.append({"role": "Assistant", "content": assistant_response})
-        conversation_history[call_id] = history
+        redis_client.set(call_id, json.dumps(history), ex=3600)
+    except Exception as e:
+        print(f"[REDIS ERROR] handle_assistant_request (SET): {e}")
 
-        # Return the response for Vapi to convert to speech
-        return {"assistant": {"role": "assistant", "content": assistant_response}}
-    except requests.RequestException as e:
-        print(f"[VOICE AGENT ERROR] Could not connect to Ollama: {e}")
-        return {"assistant": {"role": "assistant", "content": "I apologize, I'm having a momentary connection issue. Could you please repeat that?"}}
+    # 5. Return response in OpenAI format for Vapi Custom LLM
+    return {"choices": [{"message": {"role": "assistant", "content": assistant_response}}]}
+
 
 def handle_call_end(message: dict):
+    # ... (Keep existing code) ...
     call_id = message.get("call", {}).get("id")
     customer_number = message.get("call", {}).get("customer", {}).get("number")
+    # For call-end, the transcript might be in a different place
     final_transcript = message.get("transcript", "")
+    if not final_transcript and message.get("analysis"): # Sometimes it's in the analysis block
+        final_transcript = message.get("analysis", {}).get("transcript", "")
+    if not final_transcript and message.get("artifact"): # Or maybe artifact
+        final_transcript = message.get("artifact", {}).get("transcript", "")
 
-    print(f"[VOICE AGENT] Call ended: {call_id}. Final transcript available.")
+
+    print(f"[VOICE AGENT] Call ended: {call_id}.") # Removed "Final transcript available." as it might be empty
 
     if customer_number and final_transcript:
         db: Session = SessionLocal()
@@ -107,14 +129,57 @@ def handle_call_end(message: dict):
                 print(f"[VOICE AGENT] Found customer ID {customer.customer_id}. Dispatching score_lead_task.")
                 score_lead_task.delay(customer.customer_id, final_transcript)
             else:
-                # This is a business decision. For now, we only score existing customers.
                 print(f"[VOICE AGENT] No existing customer found for {customer_number}. Not scoring lead.")
         finally:
             db.close()
 
-    # Clean up state
-    if call_id in conversation_history:
-        del conversation_history[call_id]
-        print(f"[VOICE AGENT] Cleared history for call: {call_id}")
-    
+    if call_id and redis_client:
+        try:
+            redis_client.delete(call_id)
+            print(f"[VOICE AGENT] Cleared Redis history for call: {call_id}")
+        except Exception as e:
+            print(f"[REDIS ERROR] handle_call_end (DELETE): {e}")
+
     return Response(status_code=200)
+
+# --- NEW: DEDICATED ENDPOINT FOR CUSTOM LLM ---
+@router.post("/voice/webhook/chat/completions")
+async def handle_chat_completions(request: Request):
+    # --- ADD THIS LINE ---
+    print(f"--- [{datetime.datetime.now()}] HIT /chat/completions ENDPOINT ---") 
+    try:
+        payload = await request.json()
+        print(f"--- CHAT COMPLETIONS PAYLOAD RECEIVED ---\n{json.dumps(payload, indent=2)}\n---------------------------------")
+        # ... (rest of the function remains the same) ...
+        return await handle_assistant_request(payload) 
+    except Exception as e:
+        # --- ADD THIS LINE ---
+        print(f"--- [{datetime.datetime.now()}] ERROR IN /chat/completions: {e} ---") 
+        print(f"[VOICE AGENT ERROR] Failed to process chat completions: {e}")
+        return Response(status_code=500, content=f"Internal Server Error: {str(e)}")
+
+
+# --- UPDATED: ORIGINAL ENDPOINT FOR OTHER EVENTS ---
+@router.post("/voice/webhook")
+async def handle_vapi_webhook(request: Request):
+    # --- ADD THIS LINE ---
+    print(f"--- [{datetime.datetime.now()}] HIT BASE /webhook ENDPOINT ---") 
+    try:
+        payload = await request.json()
+        print(f"--- GENERAL WEBHOOK PAYLOAD RECEIVED ---\n{json.dumps(payload, indent=2)}\n---------------------------------")
+        # ... (rest of the function remains the same) ...
+        message = payload.get("message", {})
+        message_type = message.get("type")
+
+        if message_type == "call-end" or message_type == "end-of-call-report":
+             return handle_call_end(message)
+        elif message_type == "call-start":
+             return handle_call_start(message)
+        
+        return Response(status_code=200)
+
+    except Exception as e:
+         # --- ADD THIS LINE ---
+        print(f"--- [{datetime.datetime.now()}] ERROR IN BASE /webhook: {e} ---")
+        print(f"[VOICE AGENT ERROR] Failed to process general webhook: {e}")
+        return Response(status_code=500, content=f"Internal Server Error: {str(e)}")

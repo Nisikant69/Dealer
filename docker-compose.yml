@@ -49,6 +49,8 @@ services:
       CELERY_BROKER_URL: "redis://redis:6379/0" # NEW
       CELERY_RESULT_BACKEND: "redis://redis:6379/0" # NEW
       # ^ Notice we use the service name 'db' as the host
+      REDIS_URL: "redis://redis:6379/0"
+      OLLAMA_API_ENDPOINT: "http://192.168.255.104/api/generate"
     volumes:
       - ./backend:/app # Mounts your local backend code into the container for live-reloading
     networks:

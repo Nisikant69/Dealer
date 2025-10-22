@@ -13,6 +13,9 @@ class Settings(BaseSettings):
 
     VAPI_API_KEY: Optional[str] = None
     VAPI_ASSISTANT_ID: Optional[str] = None
+
+    REDIS_URL: str 
+    
     class Config:
         # This tells Pydantic to load the variables from a .env file
         env_file = ".env"
