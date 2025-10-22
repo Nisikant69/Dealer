@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+pydantic
+celery # distributed task queue and automation
+redis
+Jinja2 # document generation
+xhtml2pdf
+pydantic-settings
+gevent
+requests
