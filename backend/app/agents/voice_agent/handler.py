@@ -1,185 +1,251 @@
+# --- Imports needed at the top of handler.py ---
 import json
-import httpx
-import redis
+import redis # If not already imported
 import datetime
+import traceback
+import sys # For logging raw payload if needed
 from fastapi import Request, Response, APIRouter
 from sqlalchemy.orm import Session
 
+# Adjust these imports based on your project structure
 from ...core.config import settings
 from ...core.database import SessionLocal
 from ...models.customer_model import Customer
+from ...schemas.customer_schema import CustomerCreate # Ensure you have this Pydantic schema
 from ...workflow.tasks import score_lead_task
 
-router = APIRouter()
 
-# --- REDIS & HTTPX CLIENTS (Keep these as they were) ---
+# --- Redis Client (ensure this is defined globally in handler.py) ---
 try:
     redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
     redis_client.ping()
-    print("[VOICE AGENT] Connected to Redis successfully.")
+    print("[VOICE AGENT] ✅ Connected to Redis successfully.")
 except Exception as e:
-    print(f"[VOICE AGENT CRITICAL ERROR] Could not connect to Redis: {e}")
+    print(f"[VOICE AGENT] ❌ Could not connect to Redis: {e}")
     redis_client = None
 
-http_client = httpx.AsyncClient(timeout=25.0)
+# --- Helper Function ---
+def log_separator(title=""):
+    """Print a visual separator for better log readability."""
+    print(f"\n{'='*70}")
+    if title:
+        print(f"  {title}")
+        print(f"{'='*70}")
 
-# --- HANDLERS (Keep handle_call_start, handle_assistant_request, handle_call_end as they were) ---
+# --- Handler Functions ---
 
-def handle_call_start(message: dict):
-    # ... (Keep existing code) ...
-    call_id = message.get("call", {}).get("id")
-    if not call_id or not redis_client:
-        print("[VOICE AGENT ERROR] Call-start: No call_id or Redis client.")
-        return Response(status_code=500)
+def handle_call_start(payload: dict) -> Response:
+    """
+    Handle call-start event from Vapi.
+    Initialize Redis state if needed for tracking active calls.
+    """
+    log_separator("CALL START EVENT")
+
+    call_data = payload.get("call", {})
+    call_id = call_data.get("id")
+    customer_number = call_data.get("customer", {}).get("number")
+
+    print(f"[CALL START] Call ID: {call_id}")
+    print(f"[CALL START] Customer Number: {customer_number}")
+
+    if not call_id:
+        print("[CALL START] ❌ No call_id provided")
+        return Response(status_code=400, content="Missing call_id")
+
+    if not redis_client:
+        print("[CALL START] ⚠️ Redis client not available, cannot track call state.")
+        return Response(status_code=200) # Still acknowledge Vapi
+
     try:
-        redis_client.set(call_id, json.dumps([]), ex=3600)
-        print(f"[VOICE AGENT] Initialized Redis history for call: {call_id}")
+        # Store basic call info or an active flag
+        redis_client.set(f"call_active_{call_id}", "true", ex=3600) # Expires after 1 hour
+        print(f"[CALL START] ✅ Marked call as active in Redis")
         return Response(status_code=200)
     except Exception as e:
-        print(f"[REDIS ERROR] handle_call_start: {e}")
-        return Response(status_code=500)
-
-async def handle_assistant_request(message: dict):
-    # ... (Keep existing code for querying Ollama and updating Redis) ...
-    call_id = message.get("call", {}).get("id")
-    # Vapi sends the transcript *inside* the 'message' object for chat/completions
-    # Check both potential locations for the transcript data
-    transcript_data = message.get("transcript") # Original location
-    if not transcript_data and message.get("messages"):
-        # For chat/completions, the user message is often the last one in the list
-        user_messages = [m for m in message.get("messages", []) if m.get("role") == "user"]
-        if user_messages:
-            transcript_data = user_messages[-1].get("content")
-
-    transcript = transcript_data
-
-    if not all([call_id, transcript, redis_client, settings.OLLAMA_API_ENDPOINT]):
-        print("[VOICE AGENT ERROR] Assistant-request: Missing required data or config.")
-        return {"error": "Assistant brain is misconfigured."}
-
-    # 1. Retrieve history
-    try:
-        history_json = redis_client.get(call_id)
-        history = json.loads(history_json) if history_json else []
-    except Exception as e:
-        print(f"[REDIS ERROR] handle_assistant_request (GET): {e}")
-        return {"choices": [{"message": {"role": "assistant", "content": "I'm having trouble accessing my memory. Please repeat that."}}]} # Match OpenAI format
-
-    # 2. Construct prompt
-    formatted_history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history])
-    prompt = f"""You are a professional, polite, and efficient AI assistant...
-
-Conversation History:
-{formatted_history}
-
-User: {transcript}
-Assistant:"""
-
-    payload = {
-        "model": "llama3:8b",
-        "prompt": prompt,
-        "stream": False,
-    }
-
-    print(f"[VOICE AGENT] Sending prompt to Ollama for call {call_id}...")
-
-    # 3. Call Ollama
-    try:
-        response = await http_client.post(settings.OLLAMA_API_ENDPOINT, json=payload)
-        response.raise_for_status()
-        assistant_response = response.json().get("response", "").strip()
-        print(f"[VOICE AGENT] Received from Ollama: {assistant_response}")
-
-    except httpx.RequestError as e:
-        print(f"[VOICE AGENT ERROR] Could not connect to Ollama: {e}")
-        # Return error in OpenAI format
-        return {"choices": [{"message": {"role": "assistant", "content": "I apologize, I'm having connection issues. Could you repeat?"}}]}
-
-    # 4. Update history
-    try:
-        history.append({"role": "User", "content": transcript})
-        history.append({"role": "Assistant", "content": assistant_response})
-        redis_client.set(call_id, json.dumps(history), ex=3600)
-    except Exception as e:
-        print(f"[REDIS ERROR] handle_assistant_request (SET): {e}")
-
-    # 5. Return response in OpenAI format for Vapi Custom LLM
-    return {"choices": [{"message": {"role": "assistant", "content": assistant_response}}]}
+        print(f"[CALL START] ❌ Redis error: {e}")
+        return Response(status_code=200) # Still acknowledge Vapi even if Redis fails here
 
 
-def handle_call_end(message: dict):
-    # ... (Keep existing code) ...
-    call_id = message.get("call", {}).get("id")
-    customer_number = message.get("call", {}).get("customer", {}).get("number")
-    # For call-end, the transcript might be in a different place
-    final_transcript = message.get("transcript", "")
-    if not final_transcript and message.get("analysis"): # Sometimes it's in the analysis block
-        final_transcript = message.get("analysis", {}).get("transcript", "")
-    if not final_transcript and message.get("artifact"): # Or maybe artifact
-        final_transcript = message.get("artifact", {}).get("transcript", "")
+def handle_call_end(payload: dict) -> Response:
+    """
+    Handle call-end or end-of-call-report event from Vapi.
+    Extract transcript, add customer if new, trigger lead scoring, and cleanup.
+    ** Expects the 'message' object from the raw Vapi webhook payload **
+    """
+    log_separator("CALL END EVENT")
 
+    # --- Optional: Keep this DEBUG logging temporarily ---
+    # print("[CALL END DEBUG] Raw payload received by handle_call_end:")
+    # try:
+    #     print(json.dumps(payload, indent=2), file=sys.stderr)
+    # except Exception as log_e:
+    #     print(f"[CALL END DEBUG] Error logging payload: {log_e}")
+    # print("[CALL END DEBUG] --- End raw payload ---")
+    # --- END DEBUG ---
 
-    print(f"[VOICE AGENT] Call ended: {call_id}.") # Removed "Final transcript available." as it might be empty
+    report_data = payload # Assumes vapi_server_webhook passed the 'message' object
 
-    if customer_number and final_transcript:
+    # Extract Call ID and Customer Number safely
+    call_id = report_data.get("call", {}).get("id")
+    # If call_id is still None, try getting it from the top level of the message object (less common)
+    if not call_id:
+         call_id = report_data.get("id") # Check if call ID might be here
+
+    customer_data = report_data.get("customer", {})
+    customer_number = customer_data.get("number")
+
+    # --- Transcript Extraction Logic ---
+    transcript = ""
+    # Check primary location: message['artifact']['transcript']
+    if "artifact" in report_data and isinstance(report_data["artifact"], dict):
+        transcript = report_data["artifact"].get("transcript", "")
+        # print(f"[CALL END DEBUG] Found transcript in artifact: {bool(transcript)}") # Optional debug
+
+    # Fallback 1: Check message['transcript']
+    if not transcript:
+        transcript = report_data.get("transcript", "")
+        # print(f"[CALL END DEBUG] Found transcript at message top level: {bool(transcript)}") # Optional debug
+
+    # Fallback 2: Check message['analysis']['transcript']
+    if not transcript and "analysis" in report_data and isinstance(report_data["analysis"], dict):
+        transcript = report_data["analysis"].get("transcript", "")
+        # print(f"[CALL END DEBUG] Found transcript in analysis: {bool(transcript)}") # Optional debug
+    # --- END Transcript Logic ---
+
+    print(f"[CALL END] Call ID: {call_id}")
+    print(f"[CALL END] Customer Number: {customer_number}")
+    print(f"[CALL END] Transcript Length: {len(transcript)} characters")
+
+    # --- Add Customer if New & Trigger Lead Scoring ---
+    customer_id_for_task = None
+
+    if customer_number:
+        print(f"[CALL END] Looking up customer with phone: {customer_number}")
         db: Session = SessionLocal()
         try:
-            customer = db.query(Customer).filter(Customer.phone_number == customer_number).first()
+            customer = db.query(Customer).filter(
+                Customer.phone_number == customer_number
+            ).first()
+
             if customer:
-                print(f"[VOICE AGENT] Found customer ID {customer.customer_id}. Dispatching score_lead_task.")
-                score_lead_task.delay(customer.customer_id, final_transcript)
+                print(f"[CALL END] ✅ Found existing customer: {customer.customer_id}")
+                customer_id_for_task = customer.customer_id
             else:
-                print(f"[VOICE AGENT] No existing customer found for {customer_number}. Not scoring lead.")
+                print(f"[CALL END] ⚠️ No customer found for number: {customer_number}. Creating new customer.")
+                try:
+                    # !! IMPORTANT !! Ensure CustomerCreate schema ONLY requires phone_number
+                    # If it requires other fields (like first_name), you MUST provide defaults
+                    # or make them optional in the schema.
+                    new_customer_data = CustomerCreate(
+                        phone_number=customer_number
+                        # Add default/optional values here if needed by your schema:
+                        # first_name="Unknown",
+                        # last_name="Caller",
+                        # email=None,
+                        )
+                    new_customer = Customer(**new_customer_data.model_dump(exclude_unset=True)) # Exclude unset optional fields
+                    db.add(new_customer)
+                    db.commit()
+                    db.refresh(new_customer)
+                    customer_id_for_task = new_customer.customer_id
+                    print(f"[CALL END] ✅ Successfully created new customer: {customer_id_for_task}")
+                except Exception as create_e:
+                    db.rollback()
+                    print(f"[CALL END] ❌ Error creating new customer: {create_e}")
+                    # Log the validation error details if it's a Pydantic error
+                    if "validation error for CustomerCreate" in str(create_e):
+                         print(f"[CALL END] CustomerCreate Schema Validation Error Details: {create_e}")
+                    # customer_id_for_task remains None
+
+        except Exception as db_e:
+            print(f"[CALL END] ❌ Database lookup/connection error: {db_e}")
+            if db.is_active: # Check if rollback is safe
+                db.rollback()
         finally:
             db.close()
 
-    if call_id and redis_client:
+        # Trigger scoring task ONLY if we have a customer ID and a transcript
+        if customer_id_for_task and transcript:
+            print(f"[CALL END] Triggering lead scoring task for customer: {customer_id_for_task}...")
+            try:
+                score_lead_task.delay(customer_id_for_task, transcript)
+                print(f"[CALL END] ✅ Lead scoring task queued")
+            except Exception as task_e:
+                 print(f"[CALL END] ❌ Error queuing lead scoring task: {task_e}")
+        elif not transcript:
+             print(f"[CALL END] ⚠️ No transcript available in payload, cannot score.")
+        elif not customer_id_for_task:
+             print(f"[CALL END] ⚠️ Could not find or create customer, cannot score.")
+
+    else: # Case where customer_number was missing
+        print(f"[CALL END] ⚠️ No customer number provided in payload, cannot add customer or score.")
+
+    # --- Cleanup Redis ---
+    if redis_client and call_id:
         try:
-            redis_client.delete(call_id)
-            print(f"[VOICE AGENT] Cleared Redis history for call: {call_id}")
+            # Delete the active call marker or any other keys related to call_id
+            deleted_count = redis_client.delete(f"call_active_{call_id}") # Matches key set in handle_call_start
+            if deleted_count > 0:
+                 print(f"[CALL END] ✅ Cleared call state from Redis for call: {call_id}")
+            # else: # This log can be noisy if call_start failed or key expired
+                 # print(f"[CALL END] ⚠️ No call state found in Redis to clear for call: {call_id}")
         except Exception as e:
-            print(f"[REDIS ERROR] handle_call_end (DELETE): {e}")
+            print(f"[CALL END] ⚠️ Redis cleanup error: {e}")
 
-    return Response(status_code=200)
+    log_separator()
+    return Response(status_code=200) # Always acknowledge Vapi
 
-# --- NEW: DEDICATED ENDPOINT FOR CUSTOM LLM ---
-@router.post("/voice/webhook/chat/completions")
-async def handle_chat_completions(request: Request):
-    # --- ADD THIS LINE ---
-    print(f"--- [{datetime.datetime.now()}] HIT /chat/completions ENDPOINT ---") 
+
+# --- Main Webhook Router Function ---
+
+async def vapi_server_webhook(request: Request):
+    """
+    Server webhook endpoint for Vapi lifecycle events (call start/end etc.).
+    Receives the raw payload from Vapi, extracts the inner 'message' object,
+    and routes based on message type.
+    """
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_separator(f"[{timestamp}] VAPI SERVER WEBHOOK")
+
     try:
-        payload = await request.json()
-        print(f"--- CHAT COMPLETIONS PAYLOAD RECEIVED ---\n{json.dumps(payload, indent=2)}\n---------------------------------")
-        # ... (rest of the function remains the same) ...
-        return await handle_assistant_request(payload) 
-    except Exception as e:
-        # --- ADD THIS LINE ---
-        print(f"--- [{datetime.datetime.now()}] ERROR IN /chat/completions: {e} ---") 
-        print(f"[VOICE AGENT ERROR] Failed to process chat completions: {e}")
-        return Response(status_code=500, content=f"Internal Server Error: {str(e)}")
+        # Check for empty body before parsing JSON
+        body_bytes = await request.body()
+        if not body_bytes:
+            print("[WEBHOOK] Received empty request body. Acknowledging with 200 OK.")
+            return Response(status_code=200)
+        payload = json.loads(body_bytes)
 
-
-# --- UPDATED: ORIGINAL ENDPOINT FOR OTHER EVENTS ---
-@router.post("/voice/webhook")
-async def handle_vapi_webhook(request: Request):
-    # --- ADD THIS LINE ---
-    print(f"--- [{datetime.datetime.now()}] HIT BASE /webhook ENDPOINT ---") 
-    try:
-        payload = await request.json()
-        print(f"--- GENERAL WEBHOOK PAYLOAD RECEIVED ---\n{json.dumps(payload, indent=2)}\n---------------------------------")
-        # ... (rest of the function remains the same) ...
+        # Vapi wraps lifecycle events in a "message" object - THIS IS KEY
         message = payload.get("message", {})
-        message_type = message.get("type")
+        if not message:
+             print("[WEBHOOK] ⚠️ Payload missing 'message' object. Raw payload:")
+             print(json.dumps(payload, indent=2))
+             return Response(status_code=400, content="Invalid Vapi payload: Missing 'message' object")
 
-        if message_type == "call-end" or message_type == "end-of-call-report":
-             return handle_call_end(message)
-        elif message_type == "call-start":
-             return handle_call_start(message)
-        
-        return Response(status_code=200)
+        message_type = message.get("type", "unknown")
 
+        print(f"[WEBHOOK] Event type: {message_type}")
+
+        # Route to appropriate handler, passing the INNER message object
+        if message_type == "call-start":
+            result = handle_call_start(message)
+        elif message_type in ["call-end", "end-of-call-report"]:
+            result = handle_call_end(message) # Pass the 'message' object here
+        else:
+            # Gracefully ignore other events Vapi might send
+            print(f"[WEBHOOK] Unhandled or irrelevant event type: {message_type}")
+            # Optional: Log the payload for unhandled types during debugging
+            # print("[WEBHOOK] Unhandled Payload:")
+            # print(json.dumps(payload, indent=2))
+            print(f"[WEBHOOK] Acknowledging with 200 OK")
+            result = Response(status_code=200)
+
+        return result
+
+    except json.JSONDecodeError:
+        print(f"[ERROR] Invalid JSON received on server webhook.")
+        return Response(status_code=400, content="Invalid JSON")
     except Exception as e:
-         # --- ADD THIS LINE ---
-        print(f"--- [{datetime.datetime.now()}] ERROR IN BASE /webhook: {e} ---")
-        print(f"[VOICE AGENT ERROR] Failed to process general webhook: {e}")
+        print(f"[ERROR] Unhandled exception in server webhook endpoint: {e}")
+        traceback.print_exc()
         return Response(status_code=500, content=f"Internal Server Error: {str(e)}")

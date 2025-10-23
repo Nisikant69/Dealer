@@ -4,7 +4,7 @@ from ..agents.document_agent.generator import create_invoice_pdf
 from ..agents.communication_agent.email_handler import send_email_with_attachment
 from ..models.customer_model import Customer
 from ..agents.lead_intelligence_agent.scoring import score_lead_from_text # Import the new scoring function
-
+import time
 
 @celery_app.task(name="test_celery_task")
 def test_celery_task(word: str) -> str:
@@ -60,6 +60,7 @@ def score_lead_task(self, customer_id: int, input_text: str): # Added self for r
     Celery task to score a lead based on input text and update the customer record.
     """
     print(f"Received score_lead_task for customer_id: {customer_id}")
+    time.sleep(2)  # Simulate processing time
     db = SessionLocal()
     try:
         # Step 1: Score the lead using the imported function

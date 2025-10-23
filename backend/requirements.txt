@@ -11,3 +11,4 @@ pydantic-settings
 gevent
 requests
 httpx
+pydantic[email]

@@ -44,17 +44,39 @@ services:
       - redis
     ports:
       - "8000:8000"
+    extra_hosts:
+    - "host.docker.internal:host-gateway"
     environment:
       DATABASE_URL: "postgresql://postgres:postgres@db/db1"
       CELERY_BROKER_URL: "redis://redis:6379/0" # NEW
       CELERY_RESULT_BACKEND: "redis://redis:6379/0" # NEW
       # ^ Notice we use the service name 'db' as the host
       REDIS_URL: "redis://redis:6379/0"
-      OLLAMA_API_ENDPOINT: "http://192.168.255.104/api/generate"
+      OLLAMA_API_ENDPOINT: "http://host.docker.internal:11434/api/chat"
     volumes:
       - ./backend:/app # Mounts your local backend code into the container for live-reloading
     networks:
       - dealership_net
+
+  celery_worker:
+      build: ./backend # Use the same image as the backend
+      container_name: dealership_celery_worker
+      restart: always
+      depends_on:
+        - db
+        - redis
+        - backend # Wait for backend code to be available if mounting
+      command: celery -A app.core.celery_app worker --loglevel=INFO
+      environment:
+        CELERY_BROKER_URL: "redis://redis:6379/0"
+        CELERY_RESULT_BACKEND: "redis://redis:6379/0"
+        # --- THIS WAS THE MISSING LINE ---
+        DATABASE_URL: "postgresql://postgres:postgres@db/db1" 
+        # --- Ensure other env vars needed by tasks are also here ---
+      volumes:
+        - ./backend:/app # Mount code same as backend
+      networks:
+        - dealership_net
 
 volumes:
   postgres_data: # Persists database data even if the container is removed
