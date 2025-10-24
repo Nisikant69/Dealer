@@ -421,6 +421,3 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) file for
 - [ ] Blockchain for transaction verification
 
 ---
-
-**Built with ❤️ for luxury automotive dealerships**
-
