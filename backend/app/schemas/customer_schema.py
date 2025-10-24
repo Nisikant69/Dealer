@@ -1,23 +1,32 @@
 from pydantic import BaseModel, Field, EmailStr
 from typing import Optional
+from datetime import datetime
 
 class CustomerBase(BaseModel):
     phone_number: str = Field(..., description="Customer's phone number")
-    # Make other fields optional and provide defaults
-    first_name: Optional[str] = "11"
+    first_name: Optional[str] = "Unknown"
     last_name: Optional[str] = "Caller"
-    email: Optional[EmailStr] = None 
-    # Add any other fields from your Customer model here, making them Optional
+    email: Optional[EmailStr] = None
+    address: Optional[str] = None
 
 class CustomerCreate(CustomerBase):
-    # Inherits fields from CustomerBase. 
-    # No need to redefine if they are the same for creation.
+    """Schema for creating a new customer"""
     pass
-# Schema for reading a customer (output)
-class Customer(CustomerCreate):
+
+class CustomerUpdate(BaseModel):
+    """Schema for updating customer information"""
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone_number: Optional[str] = None
+    email: Optional[EmailStr] = None
+    address: Optional[str] = None
+    customer_type: Optional[str] = None
+
+class Customer(CustomerBase):
+    """Schema for reading a customer (output)"""
     customer_id: int
     customer_type: str
+    created_at: Optional[datetime] = None
 
     class Config:
-        from_attributes = True # Pydantic v2
-        # orm_mode = True for Pydantic v1
+        from_attributes = True

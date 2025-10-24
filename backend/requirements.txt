@@ -12,3 +12,4 @@ gevent
 requests
 httpx
 pydantic[email]
+alembic
